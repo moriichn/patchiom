@@ -82,6 +82,8 @@ public class FilePatcher {
 					MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
 					mv.visitCode();
 
+					setBooleanFieldTrue(mv, "hasServerCommercialLicense");
+
 					mv.visitFieldInsn(
 							Opcodes.GETSTATIC,
 							"com/moulberry/axiom/utils/Authorization$ServerAuthorization",
@@ -107,6 +109,8 @@ public class FilePatcher {
 				if (name.equals("checkCommercial") && cmType.equals(Type.getType(CompletableFuture.class))) {
 					MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
 					mv.visitCode();
+
+					setBooleanFieldTrue(mv, "hasCommercialLicense");
 
 					mv.visitFieldInsn(
 							Opcodes.GETSTATIC,
@@ -135,6 +139,16 @@ public class FilePatcher {
 
 		reader.accept(visitor, 0);
 		return writer.toByteArray();
+	}
+
+	private static void setBooleanFieldTrue(MethodVisitor mv, String name) {
+		mv.visitInsn(Opcodes.ICONST_1);
+		mv.visitFieldInsn(
+				Opcodes.PUTSTATIC,
+				"com/moulberry/axiom/utils/Authorization",
+				name,
+				"Z"
+		);
 	}
 
 }
