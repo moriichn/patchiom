@@ -1,74 +1,82 @@
 package dev.mori.patchiom.file;
 
 import dev.mori.patchiom.log.OutputAdapter;
+import dev.mori.patchiom.util.UnicodeNormalize;
 import org.objectweb.asm.*;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.util.Enumeration;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.jar.JarEntry;
-import java.util.jar.JarFile;
+import java.util.jar.JarInputStream;
 import java.util.jar.JarOutputStream;
 
 public class FilePatcher {
 
+	// subject to change, I'm ready for war, patch this shit, and I'll update it.
+	private static final Set<String> CANDIDATE_CLASS_NAMES = Set.of("com/moulberry/axiom/utils/Authorization.class");
+
 	public static void patchJar(Path inputJar, Path outputJar, OutputAdapter log) throws IOException {
-		log.info("Reading jar..");
 		try (
-				JarFile jarFile = new JarFile(inputJar.toFile());
-				OutputStream outputStream = Files.newOutputStream(outputJar, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-				JarOutputStream jarOutput = new JarOutputStream(outputStream)
+				InputStream in = Files.newInputStream(inputJar);
+				JarInputStream jarInput = new JarInputStream(in);
+				OutputStream out = Files.newOutputStream(outputJar, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
 		) {
-			log.info("Iterating entries..");
-			Enumeration<JarEntry> entries = jarFile.entries();
-			boolean patched = false;
-
-			while (entries.hasMoreElements()) {
-				JarEntry originalEntry = entries.nextElement();
-
-				JarEntry newEntry = new JarEntry(originalEntry.getName());
-				newEntry.setTime(originalEntry.getTime());
-
-				if (originalEntry.getComment() != null) {
-					newEntry.setComment(originalEntry.getComment());
-				}
-
-				if (originalEntry.getExtra() != null) {
-					newEntry.setExtra(originalEntry.getExtra());
-				}
-
-				jarOutput.putNextEntry(newEntry);
-
-				try (InputStream in = jarFile.getInputStream(originalEntry)) {
-					if ("com/moulberry/axiom/utils/Authorization.class".equals(originalEntry.getName())) {
-						log.info("Reading class " + originalEntry.getName());
-						byte[] originalBytes = in.readAllBytes();
-						log.info("Patching class " + originalEntry.getName());
-						byte[] patchedBytes = patchClass(originalBytes);
-						log.info("Writing patched class..");
-						jarOutput.write(patchedBytes);
-						log.info("Written patched class to output");
-						patched = true;
-					} else {
-						in.transferTo(jarOutput);
-					}
-				}
-
-				jarOutput.closeEntry();
-			}
-
-			if(!patched) {
-				throw new IllegalStateException("Can't find target class in jar");
+			if(!patchJar(jarInput, out, log)) {
+				throw new IllegalStateException("Can't find anything to patch. If this is a version of the mod newer than this release of the patcher, please open an issue.");
 			}
 		}
 	}
 
-	private static byte[] patchClass(byte[] classBytes) {
+	private static boolean patchJar(JarInputStream input, OutputStream output, OutputAdapter log) throws IOException {
+		try (JarOutputStream jarOutput = new JarOutputStream(output)) {
+			boolean patched = false;
+			JarEntry entry;
+
+			while ((entry = input.getNextJarEntry()) != null) {
+				String name = entry.getName();
+				JarEntry outputEntry = new JarEntry(name);
+				outputEntry.setTime(entry.getTime());
+
+				if (entry.getComment() != null) {
+					outputEntry.setComment(entry.getComment());
+				}
+
+				if (entry.getExtra() != null) {
+					outputEntry.setExtra(entry.getExtra());
+				}
+
+				jarOutput.putNextEntry(outputEntry);
+
+				byte[] data = input.readAllBytes();
+
+				if (CANDIDATE_CLASS_NAMES.contains(UnicodeNormalize.normalizeCharacters(name))) {
+					log.info("Patching class " + name);
+					String plain = name.substring(0, name.lastIndexOf(".class"));
+					data = patchClass(data, plain, plain + "$ServerAuthorization");
+					patched = true;
+				} else if (name.endsWith(".jar")) {
+					log.progress("Discovered nested jar '" + name + "'..");
+
+					try (JarInputStream nestedInput = new JarInputStream(new ByteArrayInputStream(data))) {
+						ByteArrayOutputStream nestedOutput = new ByteArrayOutputStream();
+						patched |= patchJar(nestedInput, nestedOutput, log);
+						data = nestedOutput.toByteArray();
+					}
+				}
+
+				jarOutput.write(data);
+				jarOutput.closeEntry();
+			}
+
+			return patched;
+		}
+	}
+
+	private static byte[] patchClass(byte[] classBytes, String owner, String resultEnumDescriptor) {
 		ClassReader reader = new ClassReader(classBytes);
 		ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_FRAMES);
 
@@ -82,13 +90,13 @@ public class FilePatcher {
 					MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
 					mv.visitCode();
 
-					setBooleanFieldTrue(mv, "hasServerCommercialLicense");
+					setBooleanFieldTrue(mv, owner, "hasServerCommercialLicense");
 
 					mv.visitFieldInsn(
 							Opcodes.GETSTATIC,
-							"com/moulberry/axiom/utils/Authorization$ServerAuthorization",
+							resultEnumDescriptor,
 							"COMMERCIAL",
-							"Lcom/moulberry/axiom/utils/Authorization$ServerAuthorization;"
+							"L" + resultEnumDescriptor + ";"
 					);
 
 					mv.visitMethodInsn(
@@ -110,7 +118,7 @@ public class FilePatcher {
 					MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
 					mv.visitCode();
 
-					setBooleanFieldTrue(mv, "hasCommercialLicense");
+					setBooleanFieldTrue(mv, owner, "hasCommercialLicense");
 
 					mv.visitFieldInsn(
 							Opcodes.GETSTATIC,
@@ -141,11 +149,11 @@ public class FilePatcher {
 		return writer.toByteArray();
 	}
 
-	private static void setBooleanFieldTrue(MethodVisitor mv, String name) {
+	private static void setBooleanFieldTrue(MethodVisitor mv, String owner, String name) {
 		mv.visitInsn(Opcodes.ICONST_1);
 		mv.visitFieldInsn(
 				Opcodes.PUTSTATIC,
-				"com/moulberry/axiom/utils/Authorization",
+				owner,
 				name,
 				"Z"
 		);
